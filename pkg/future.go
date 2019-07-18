@@ -5,77 +5,90 @@ import (
 	"time"
 )
 
+type futureState int
+
+// The  future states
+const (
+	PENDING futureState = iota
+	RUNNING
+	CANCELLED
+	FINISHED
+)
+
 type futureResult struct {
-	get func() (interface{}, error)
+	val interface{}
+	err error
 }
 
 // Future represents a value (or error) to be
 // available at some later time.
 type Future struct {
-	cancelCh chan struct{}
+	// (result, err) represents future result
+	result interface{}
+	err    error
 
-	// Future is done
-	done bool
+	state futureState
+
+	done   chan struct{}
+	cancel chan struct{}
 
 	// OnComplete callback, called when the future is cancelled
 	// or finishes running.
 	callback func()
-
-	result futureResult
 }
 
 // NewFuture creates Future
 func NewFuture() *Future {
-	return &Future{
-		cancelCh: make(chan struct{}, 1),
-		done:     false,
+
+	future := Future{
+		state:    PENDING,
+		done:     make(chan struct{}),
+		cancel:   make(chan struct{}),
 		callback: nil,
 		result:   futureResult{},
 	}
+	return &future
 }
 
 // Submit a function and run it
-func (f *Future) Submit(callable func() (interface{}, error)) {
-	var result interface{}
-	var err error
-
-	c := make(chan struct{}, 1)
+func (f *Future) Submit(run func() (interface{}, error)) {
+	f.state = RUNNING
 
 	go func() {
 		defer func() {
-			close(c)
-			f.done = true
-			if f.callback != nil {
-				// onComplete callback
-				f.callback()
-			}
+			close(f.done)
+			f.invokeCallback()
 		}()
 
-		result, err = callable()
+		select {
+		case <-f.cancel:
+			return
+		default:
+			f.result, f.err = run()
+			f.state = FINISHED
+		}
 	}()
+}
 
-	f.result = futureResult{
-		get: func() (interface{}, error) {
-			select {
-			case <-c:
-				return result, err
-			}
-		},
+// Get the result of Future
+func (f *Future) Get() (interface{}, error) {
+	select {
+	case <-f.done:
+		return f.result, f.err
+	case <-f.cancel:
+		return nil, errors.New("canceled")
 	}
 }
 
-// Get result of Future
-func (f *Future) Get() (interface{}, error) {
-	return f.result.get()
-}
-
-// GetTimeout result of Future with timeout
-func (f *Future) GetTimeout(timeout time.Duration) (interface{}, error) {
+// GetUntil result of Future return timeout error after d ms
+func (f *Future) GetUntil(d time.Duration) (interface{}, error) {
 	select {
-	case <-time.After(timeout):
+	case <-time.After(d * time.Millisecond):
 		return nil, errors.New("timeout")
-	default:
-		return f.result.get()
+	case <-f.done:
+		return f.result, f.err
+	case <-f.cancel:
+		return nil, errors.New("canceled")
 	}
 }
 
@@ -85,20 +98,37 @@ func (f *Future) onComplete(callback func()) {
 	f.callback = callback
 }
 
-// Cancel cancels a future, can not be canceled when future is done.
-func (f *Future) Cancel() error {
-	if f.done {
-		return errors.New("Cannot cancel future when status is Done")
+func (f *Future) invokeCallback() {
+	if f.callback != nil {
+		f.callback()
 	}
-	return nil
+}
+
+// Cancel the future if possible.
+// Returns true if the future was cancelled, false otherwise. A future
+// cannot be cancelled if it is running or has already completed.
+func (f *Future) Cancel() bool {
+	defer f.invokeCallback()
+
+	if f.state == RUNNING || f.state == FINISHED {
+		return false
+	}
+	if f.state == CANCELLED {
+		return true
+	}
+
+	close(f.cancel)
+	f.state = CANCELLED
+
+	return true
 }
 
 // IsCancelled returns true if the call was successfully cancelled.
 func (f *Future) IsCancelled() bool {
-	// TODO
+	return f.state == CANCELLED
 }
 
-// IsDone returns true if the call was successfully cancelled
+// IsDone returns true if the call was successfully cancelled or finished.
 func (f *Future) IsDone() bool {
-	return f.done
+	return f.state == FINISHED || f.IsCancelled()
 }
